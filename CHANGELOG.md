@@ -1,5 +1,13 @@
 # Changelog
 
+## TypeScript 0.1.0 (`typescript-v0.1.0`)
+
+- Add a server-side Node.js SDK with typed configuration and principals.
+- Reuse openid-client for authorization-code login, S256 PKCE, introspection, and revocation.
+- Keep tokens in bounded process-local sessions and recheck current permission for protected work.
+- Include a Node HTTP example and package installation through a fixed GitHub release.
+- Add shared language, framework, and code recommendations. Applications retain their own stacks; security and isolation remain required.
+
 ## Python 0.1.0 (`python-v0.1.0`)
 
 - Publish the existing hosted Python login flow as `hiro_app_auth`.

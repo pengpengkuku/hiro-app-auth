@@ -1,0 +1,35 @@
+{
+  "name": "@hiro/app-auth",
+  "version": "0.1.0",
+  "description": "Server-side Hiro application authentication",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "LICENSE",
+    "examples"
+  ],
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "pack": "npm run build && npm pack --ignore-scripts"
+  },
+  "dependencies": {
+    "openid-client": "6.8.9"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  },
+  "private": true
+}

@@ -2,6 +2,22 @@
 
 Use this guide when adding Hiro login to a separate application repository. The application keeps its own build, runtime, data, and release process. A compatible application update does not require merging into or restarting Hiro.
 
+## Technology and code choices
+
+Each application keeps its own language, framework, and release process. These choices are recommendations; the authentication, isolation, secret-handling, and data-safety requirements below are mandatory.
+
+| Area | Recommendation |
+|---|---|
+| Existing applications | Keep the established stack and build process when they meet the integration requirements. |
+| New web applications | Prefer TypeScript when sharing types across the frontend and backend makes the application easier to maintain. Use server-side authentication; keep credentials out of browser bundles. |
+| Backend services | Consider Go for a small compiled service. Python remains supported when it fits the application or an existing codebase. |
+| Frameworks and dependencies | Use maintained, supported releases. Reuse the standard library, framework features, and established packages before building an alternative. Pin dependencies and commit the appropriate lockfile. |
+| User interface | Reuse the application's component system. Keep layout, actions, feedback, and keyboard behavior consistent. |
+| Code | Use clear names, explicit data flow, local side effects, and small modules with one responsibility. Remove duplicate implementations and unnecessary forwarding layers. Report failures instead of swallowing them. |
+| TypeScript | Enable strict checking. Treat external values as unknown until validated; avoid broad `any` and unchecked assertions. |
+| Verification | Test complete user stories and important integration boundaries. Reuse existing checks and show that the protected behavior fails when its connection is deliberately broken. |
+| Updates | Pin source and artifact versions. State compatibility, migrations, and recovery steps. Upgrade only the affected application. |
+
 ## 1. Agree on the connection
 
 Obtain these values from the platform operator before connecting. Example domains and IDs in this repository are not working platform registrations.
@@ -16,13 +32,15 @@ Do not read Hiro's account database, session store, signing keys, or source file
 
 ## 2. Connect authentication
 
-Choose [Python](python/README.md) or [Go](GO.md). The SDKs expose different session designs; follow the chosen guide rather than mixing their configuration.
+Choose [TypeScript](typescript/README.md), [Python](python/README.md), or [Go](GO.md). The SDKs expose different session designs; follow the chosen guide rather than mixing their configuration.
+
+For TypeScript, start with the [Node HTTP example](typescript/examples/http-app.mjs). The SDK uses openid-client for the authorization-code and S256 PKCE flow. Install it only on the server. Tokens stay in process memory.
 
 For Python, start with the [HTTP example](python/examples/http_app.py). It includes login, callback, a protected identity response, and logout. It is a single-process integration example behind HTTPS, not a production web server or a complete business application.
 
 For Go, keep the existing trusted OAuth callback and pass its validated opaque access token to `BindSession`. The application retains responsibility for state, nonce where applicable, PKCE, and callback validation.
 
-For either SDK:
+For all SDKs:
 
 1. Load deployment-owned settings at startup. Missing configuration must fail startup, with configuration names rather than secret values in the error.
 2. Authenticate every protected request on the server. Never accept a user ID, role, email, or identity header supplied by the browser as proof of identity.
@@ -94,8 +112,8 @@ Prove a necessary protection can fail: temporarily remove an ownership predicate
 
 Pin the source commit, SDK version, and final artifact digest. Publish configuration, migration, and data compatibility changes in the application's changelog. A compatible release updates only this application's artifact, configuration, and data; new platform permissions or breaking protocols need platform agreement first.
 
-SDK releases use independent tags: `vX.Y.Z` for the Go module and `python-vX.Y.Z` for Python. Do not move an existing tag. Python artifacts are distributed through GitHub releases, not an unapproved PyPI upload. Retain the Apache license when vendoring source.
+SDK releases use independent tags: `typescript-vX.Y.Z`, `vX.Y.Z` for Go, and `python-vX.Y.Z`. Do not move an existing tag. TypeScript and Python artifacts are distributed through GitHub releases. Do not publish them to npm or PyPI without a separate release decision. Retain the Apache license when vendoring source.
 
-For SDK contributors, run the commands in [the root guide](README.md#develop) and build Python with `python -m build python`. Inspect the wheel metadata and included license. Reuse consuming-application evidence for unchanged behavior; rerun the affected story when the SDK changes a real boundary.
+For SDK contributors, run the commands in [the root guide](README.md#develop) build TypeScript with `npm --prefix typescript run build`, and build Python with `python -m build python`. Inspect the wheel metadata and included license. Reuse consuming-application evidence for unchanged behavior; rerun the affected story when the SDK changes a real boundary.
 
 The current platform's external-application contract remains authoritative for registration, deployment approval, and data handling. This public guide explains SDK integration; it does not grant access, deploy an application, or replace that contract.
