@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	appauth "github.com/hiro-assistant/hiro-app-auth"
+	appauth "github.com/pengpengkuku/hiro-app-auth"
 )
 
 func TestAuthorizationJourney(t *testing.T) {

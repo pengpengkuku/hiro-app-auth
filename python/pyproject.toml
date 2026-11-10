@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hiro-app-auth"
+version = "0.1.0"
+description = "Framework-independent Hiro app authentication"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = ["Programming Language :: Python :: 3", "Operating System :: OS Independent"]
+dependencies = [
+    "requests-oauthlib==2.0.0",
+    "oauthlib==3.3.1",
+    "requests==2.32.5",
+]
+
+[project.urls]
+Repository = "https://github.com/pengpengkuku/hiro-app-auth"
+Documentation = "https://github.com/pengpengkuku/hiro-app-auth/blob/main/python/README.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]

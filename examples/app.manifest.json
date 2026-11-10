@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "id": "example-notes",
+  "version": "0.1.0",
+  "kind": "web-service",
+  "display": {
+    "name": "Personal notes",
+    "description": "Write, save, and export your notes.",
+    "dataVisibility": "private",
+    "category": "productivity"
+  },
+  "platformContract": "CONFIRM_WITH_PLATFORM",
+  "identity": {
+    "profile": "hiro-native-opaque",
+    "clientId": "ASSIGNED_BY_PLATFORM",
+    "publicOrigin": "https://notes.example.invalid",
+    "callback": "https://notes.example.invalid/auth/callback"
+  },
+  "source": {
+    "repository": "https://example.invalid/your-repository",
+    "commit": "REPLACE_WITH_REVIEWED_FULL_SHA",
+    "license": "DECLARE_APPLICATION_LICENSE",
+    "maintainer": "DECLARE_MAINTAINER"
+  },
+  "artifact": {
+    "image": "REPLACE_WITH_IMAGE_AT_SHA256_DIGEST"
+  },
+  "deployment": {
+    "compose": "compose.yaml",
+    "entryService": "app"
+  },
+  "configuration": [
+    {
+      "name": "HIRO_MANAGED",
+      "required": true,
+      "secret": false,
+      "default": "true"
+    },
+    {
+      "name": "APP_AUTH_ISSUER",
+      "required": true,
+      "secret": false
+    },
+    {
+      "name": "APP_AUTH_CLIENT_ID",
+      "required": true,
+      "secret": false
+    },
+    {
+      "name": "APP_AUTH_CLIENT_SECRET_FILE",
+      "required": true,
+      "secret": true,
+      "reference": "DEPLOYMENT_OWNED_SECRET_FILE"
+    },
+    {
+      "name": "APP_PUBLIC_ORIGIN",
+      "required": true,
+      "secret": false
+    }
+  ],
+  "data": {
+    "ownership": [
+      "issuer",
+      "subject"
+    ],
+    "persistentPaths": [
+      "/data"
+    ],
+    "migration": "DECLARE_COMMAND",
+    "backup": "DECLARE_CONSISTENT_BACKUP",
+    "restore": "DECLARE_RESTORE_CHECK",
+    "userExport": "DECLARE_OWNER_FILTERED_ENDPOINT_OR_COMMAND",
+    "userDelete": "DECLARE_OWNER_FILTERED_ENDPOINT_OR_COMMAND",
+    "compatibleVersions": [
+      "0.1.0"
+    ]
+  },
+  "permissions": {
+    "outbound": [
+      "PLATFORM_APPROVED_ISSUER_HOST"
+    ],
+    "platform": [
+      "openid",
+      "hiro.app"
+    ]
+  },
+  "usage": {
+    "paidProviders": false,
+    "limitsOwner": "application-and-deployment"
+  }
+}
