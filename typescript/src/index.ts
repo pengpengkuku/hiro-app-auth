@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import * as oauth from 'openid-client';
 
 export type Principal = Readonly<{ issuer: string; subject: string }>;
@@ -8,6 +9,8 @@ export type Config = Readonly<{
   clientId: string;
   clientSecret: string;
   publicOrigin: string;
+  httpOrigins?: readonly string[];
+  browserOrigin?: string;
 }>;
 export type CookieResult = Readonly<{ setCookies: readonly string[] }>;
 export type LoginResult = CookieResult & Readonly<{ location: string }>;
@@ -18,6 +21,7 @@ export type HiroAuth = Readonly<{
   callback(headers: Headers, url: URL): Promise<CallbackResult>;
   requireUser(headers: Headers): Promise<Principal>;
   check(principal: Principal): Promise<Principal>;
+  serviceRequest(principal: Principal, request: Request): Promise<Response>;
   logout(headers: Headers): Promise<LogoutResult>;
 }>;
 
@@ -40,13 +44,32 @@ const clearCookie = (name: string): string => cookie(name, '') + '; Max-Age=0';
 const tokenId = (): string => randomBytes(32).toString('base64url');
 const now = (): number => Date.now() / 1000;
 
-function cookie(name: string, value: string): string {
-  return `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax`;
+function cookie(name: string, value: string, secure = true): string {
+  return `${name}=${value}; Path=/;${secure ? ' Secure;' : ''} HttpOnly; SameSite=Lax`;
 }
 
 /** Apply these on callback failure. A consumed or invalid sign-in cannot be retried. */
-export function clearPendingCookies(): readonly string[] {
-  return [clearCookie(PENDING)];
+export function clearPendingCookies(config?: Config): readonly string[] {
+  if (!config || browserUrl(config.publicOrigin, config.httpOrigins).protocol === 'https:') return [clearCookie(PENDING)];
+  return [cookie(httpCookieName(config.clientId, 'pending'), '', false) + '; Max-Age=0'];
+}
+
+function httpCookieName(clientId: string, kind: string): string {
+  return `hiro-app-${createHash('sha256').update(clientId).digest('hex').slice(0, 32)}${kind === 'pending' ? '-pending' : ''}`;
+}
+
+function browserUrl(value: string, httpOrigins: readonly string[] = []): URL {
+  if (typeof value !== 'string' || /[\s\u0000-\u0020\u007f\\?#]/u.test(value)) throw new Error(INVALID_CONFIG);
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error(INVALID_CONFIG); }
+  if (url.protocol === 'https:') return httpsUrl(value);
+  const host = url.hostname;
+  const octets = host.split('.').map(Number);
+  const privateIPv4 = isIP(host) === 4 && (octets[0] === 10 || (octets[0] === 172 && (octets[1] ?? -1) >= 16 && (octets[1] ?? -1) <= 31)
+    || (octets[0] === 192 && octets[1] === 168) || octets[0] === 127);
+  if (url.protocol !== 'http:' || !privateIPv4 || !url.port || value.split('/')[2] !== url.host
+    || url.username || url.password || url.search || url.hash || !httpOrigins.includes(url.origin)) throw new Error(INVALID_CONFIG);
+  return url;
 }
 
 function cookieValue(headers: Headers, name: string): string {
@@ -73,19 +96,25 @@ function httpsUrl(value: string): URL {
 
 function validateConfig(config: Config): Config {
   httpsUrl(config.issuer);
-  const origin = httpsUrl(config.publicOrigin);
+  if (config.httpOrigins !== undefined && (!Array.isArray(config.httpOrigins)
+    || config.httpOrigins.some((value) => { const url = browserUrl(value, [value]); return url.protocol !== 'http:' || url.origin !== value; }))) throw new Error(INVALID_CONFIG);
+  const origin = browserUrl(config.publicOrigin, config.httpOrigins);
+  if (config.browserOrigin !== undefined) {
+    const browser = browserUrl(config.browserOrigin, config.httpOrigins);
+    if (browser.protocol !== 'http:' || browser.origin !== config.browserOrigin) throw new Error(INVALID_CONFIG);
+  }
   if (config.issuer.endsWith('/') || origin.origin !== config.publicOrigin
     || typeof config.clientId !== 'string' || !config.clientId.trim() || config.clientId.length > 256
     || typeof config.clientSecret !== 'string' || !config.clientSecret
     || /[\u0000-\u001f\u007f]/u.test(config.clientId + config.clientSecret)) {
     throw new Error(INVALID_CONFIG);
   }
-  return Object.freeze({ ...config });
+  return Object.freeze({ ...config, ...(config.httpOrigins ? { httpOrigins: Object.freeze([...config.httpOrigins]) } : {}) });
 }
 
 /** Missing auth settings return null. Any declared but incomplete settings fail closed. */
 export function loadConfig(environment: Readonly<Record<string, string | undefined>>): Config | null {
-  const names = ['APP_AUTH_ISSUER', 'APP_AUTH_CLIENT_ID', 'APP_AUTH_CLIENT_SECRET_FILE', 'APP_PUBLIC_ORIGIN'];
+  const names = ['APP_AUTH_ISSUER', 'APP_AUTH_CLIENT_ID', 'APP_AUTH_CLIENT_SECRET_FILE', 'APP_PUBLIC_ORIGIN', 'APP_AUTH_HTTP_ORIGINS', 'APP_AUTH_BROWSER_ORIGIN'];
   if (environment.HIRO_MANAGED === undefined && !names.some((name) => name in environment)) return null;
   const issuer = environment.APP_AUTH_ISSUER;
   const clientId = environment.APP_AUTH_CLIENT_ID;
@@ -97,7 +126,11 @@ export function loadConfig(environment: Readonly<Record<string, string | undefin
   let clientSecret: string;
   try { clientSecret = readFileSync(secretFile, 'utf8').replace(/[\r\n]+$/u, ''); }
   catch { throw new Error('The authentication secret file could not be read.'); }
-  return validateConfig({ issuer, clientId, clientSecret, publicOrigin });
+  const httpOrigins: unknown = environment.APP_AUTH_HTTP_ORIGINS === undefined ? undefined : JSON.parse(environment.APP_AUTH_HTTP_ORIGINS);
+  if (httpOrigins !== undefined && (!Array.isArray(httpOrigins) || !httpOrigins.every((value): value is string => typeof value === 'string'))) throw new Error(INVALID_CONFIG);
+  return validateConfig({ issuer, clientId, clientSecret, publicOrigin,
+    ...(httpOrigins === undefined ? {} : { httpOrigins }),
+    ...(environment.APP_AUTH_BROWSER_ORIGIN === undefined ? {} : { browserOrigin: environment.APP_AUTH_BROWSER_ORIGIN }) });
 }
 
 type PendingLogin = Readonly<{
@@ -188,11 +221,17 @@ async function discover(config: Config, transport: typeof fetch): Promise<oauth.
   return client;
 }
 
-/** Create one instance per app process. Tokens never leave this instance. */
+/** Create one instance per app process. Tokens are sent only to the configured Hiro origin. */
 export async function createHiroAuth(config: Config, options: Readonly<{ fetch?: typeof fetch }> = {}): Promise<HiroAuth> {
   const settings = validateConfig(config);
+  const secure = new URL(settings.publicOrigin).protocol === 'https:';
+  const sessionCookie = secure ? SESSION : httpCookieName(settings.clientId, 'session');
+  const pendingCookie = secure ? PENDING : httpCookieName(settings.clientId, 'pending');
+  const setCookie = (name: string, value: string): string => cookie(name, value, secure);
+  const clear = (name: string): string => setCookie(name, '') + '; Max-Age=0';
+  const transport = options.fetch ?? globalThis.fetch;
   let client: oauth.Configuration;
-  try { client = await discover(settings, boundedFetch(options.fetch ?? globalThis.fetch)); }
+  try { client = await discover(settings, boundedFetch(transport)); }
   catch { throw new AuthError('Hiro discovery is unavailable or invalid.', 503); }
   const pending = new Map<string, PendingLogin>();
   const sessions = new Map<string, Session>();
@@ -239,16 +278,18 @@ export async function createHiroAuth(config: Config, options: Readonly<{ fetch?:
       cleanup();
       if (pending.size >= LIMIT) throw new AuthError('Too many pending sign-ins. Try again later.', 503);
       const id = tokenId();
-      const location = oauth.buildAuthorizationUrl(client, {
+      const authorization = oauth.buildAuthorizationUrl(client, {
         redirect_uri: settings.publicOrigin + '/auth/callback', scope: 'openid hiro.app', state,
         code_challenge: challenge, code_challenge_method: 'S256',
-      }).href;
+      });
+      const location = settings.browserOrigin
+        ? settings.browserOrigin + authorization.pathname + authorization.search : authorization.href;
       pending.set(id, { phase: 'pending', expires: now() + 300, state, verifier });
-      return { location, setCookies: [cookie(PENDING, id)] };
+      return { location, setCookies: [setCookie(pendingCookie, id)] };
     },
     async callback(headers: Headers, url: URL): Promise<CallbackResult> {
       cleanup();
-      const id = cookieValue(headers, PENDING);
+      const id = cookieValue(headers, pendingCookie);
       const attempt = pending.get(id);
       if (!attempt || attempt.phase !== 'pending') throw new AuthError();
       const exchanging = { ...attempt, phase: 'exchanging' } satisfies PendingLogin;
@@ -278,7 +319,7 @@ export async function createHiroAuth(config: Config, options: Readonly<{ fetch?:
         }
         cleanup();
         if (pending.get(id) !== exchanging || exchanging.expires <= now() || grant.expires <= now()) throw new AuthError();
-        const previousId = cookieValue(headers, SESSION);
+        const previousId = cookieValue(headers, sessionCookie);
         if (sessions.size >= LIMIT && !sessions.has(previousId)) {
           throw new AuthError('Session capacity has been reached. Try again later.', 503);
         }
@@ -286,14 +327,14 @@ export async function createHiroAuth(config: Config, options: Readonly<{ fetch?:
         const principal = Object.freeze({ issuer: settings.issuer, subject: grant.subject });
         const sessionId = tokenId();
         sessions.set(sessionId, { token, principal, expires: grant.expires });
-        return { principal, setCookies: [clearCookie(PENDING), cookie(SESSION, sessionId)] };
+        return { principal, setCookies: [clear(pendingCookie), setCookie(sessionCookie, sessionId)] };
       } finally {
         if (pending.get(id) === exchanging) pending.delete(id);
       }
     },
     async requireUser(headers: Headers): Promise<Principal> {
       cleanup();
-      const id = cookieValue(headers, SESSION);
+      const id = cookieValue(headers, sessionCookie);
       const session = sessions.get(id);
       if (!session) throw new AuthError();
       return checkSession(id, session);
@@ -303,12 +344,39 @@ export async function createHiroAuth(config: Config, options: Readonly<{ fetch?:
       for (const [id, session] of sessions) if (session.principal === principal) return checkSession(id, session);
       throw new AuthError();
     },
+    async serviceRequest(principal: Principal, request: Request): Promise<Response> {
+      const origin = new URL(settings.issuer).origin;
+      const endpoints = ['images/generations', 'images/edits', 'responses'];
+      if (request.method !== 'POST'
+        || !endpoints.some((path) => request.url === `${origin}/api/app-services/openai/v1/${path}`)
+        || [...request.headers.keys()].some((name) => !['accept', 'content-type'].includes(name))) {
+        throw new TypeError('Use an exact workbench service POST endpoint with only Accept and Content-Type headers.');
+      }
+      cleanup();
+      for (const [id, session] of sessions) {
+        if (session.principal !== principal) continue;
+        await checkSession(id, session);
+        const headers = new Headers(request.headers);
+        headers.set('Authorization', `Bearer ${session.token}`);
+        const outgoing = new Request(request, {
+          headers, redirect: 'manual', credentials: 'omit', referrer: '', referrerPolicy: 'no-referrer',
+          signal: AbortSignal.any([request.signal, AbortSignal.timeout(600_000)]),
+        });
+        const response = await transport(outgoing);
+        if (response.redirected || (response.status >= 300 && response.status < 400)) {
+          await response.body?.cancel();
+          throw new Error('Workbench service redirect refused. The provider outcome may be unknown.');
+        }
+        return response;
+      }
+      throw new AuthError();
+    },
     async logout(headers: Headers): Promise<LogoutResult> {
       cleanup();
-      const id = cookieValue(headers, SESSION);
+      const id = cookieValue(headers, sessionCookie);
       const session = sessions.get(id);
       sessions.delete(id);
-      pending.delete(cookieValue(headers, PENDING));
+      pending.delete(cookieValue(headers, pendingCookie));
       let revocationConfirmed = false;
       if (session) {
         try {
@@ -316,7 +384,7 @@ export async function createHiroAuth(config: Config, options: Readonly<{ fetch?:
           revocationConfirmed = true;
         } catch { /* Local logout remains effective when revocation is unavailable. */ }
       }
-      return { setCookies: [clearCookie(SESSION), clearCookie(PENDING)], revocationConfirmed };
+      return { setCookies: [clear(sessionCookie), clear(pendingCookie)], revocationConfirmed };
     },
   });
 }

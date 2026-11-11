@@ -17,16 +17,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 var (
-	ErrUnauthenticated = errors.New("appauth: authentication required")
-	ErrForbidden       = errors.New("appauth: application permission required")
-	ErrUnavailable     = errors.New("appauth: identity service unavailable")
-	ErrConfiguration   = errors.New("appauth: invalid configuration")
-	ErrCookieTooLarge  = errors.New("appauth: authorization cookie exceeds limit")
+	ErrUnauthenticated    = errors.New("appauth: authentication required")
+	ErrForbidden          = errors.New("appauth: application permission required")
+	ErrUnavailable        = errors.New("appauth: identity service unavailable")
+	ErrConfiguration      = errors.New("appauth: invalid configuration")
+	ErrCookieTooLarge     = errors.New("appauth: authorization cookie exceeds limit")
+	ErrServiceRequest     = errors.New("appauth: invalid workbench service request")
+	ErrServiceUnavailable = errors.New("appauth: workbench service request failed; provider outcome may be unknown")
 )
 
 // Principal identifies the current user. Applications must still enforce resource ownership.
@@ -44,6 +47,7 @@ type Config struct {
 	ClientSecretFile string
 	CookieKeyFile    string
 	PublicOrigin     string
+	HTTPOrigins      []string
 	HTTPClient       *http.Client
 }
 
@@ -88,7 +92,15 @@ func New(config Config) (*Client, error) {
 	if err != nil || config.ClientID == "" || len(config.ClientID) > 256 || strings.ContainsAny(config.ClientID, "\x00\r\n") {
 		return nil, ErrConfiguration
 	}
+	for _, raw := range config.HTTPOrigins {
+		if _, err := browserOrigin(raw, config.HTTPOrigins); err != nil {
+			return nil, ErrConfiguration
+		}
+	}
 	origin, err := trustedURL(config.PublicOrigin)
+	if err != nil {
+		origin, err = browserOrigin(config.PublicOrigin, config.HTTPOrigins)
+	}
 	if err != nil || (origin.Path != "" && origin.Path != "/") {
 		return nil, ErrConfiguration
 	}
@@ -188,6 +200,65 @@ func (c *Client) RequireUser(ctx context.Context, headers http.Header) (Principa
 		return Principal{}, ErrUnauthenticated
 	}
 	return Principal{c.issuer, value.Subject}, nil
+}
+
+// ServiceRequest rechecks the session cookie and sends its token only to a fixed
+// workbench service endpoint. The caller owns response.Body and must close it.
+// It never retries. A transport failure does not prove the supplier did no work.
+func (c *Client) ServiceRequest(ctx context.Context, headers http.Header, request *http.Request) (*http.Response, error) {
+	if request == nil || request.URL == nil || request.Method != http.MethodPost {
+		return nil, ErrServiceRequest
+	}
+	issuer, _ := url.Parse(c.issuer)
+	target := request.URL
+	if target.Scheme != issuer.Scheme || target.Host != issuer.Host || target.User != nil || target.RawQuery != "" || target.ForceQuery || target.Fragment != "" || target.RawPath != "" || target.Opaque != "" || (request.Host != "" && request.Host != target.Host) || len(request.Trailer) != 0 {
+		return nil, ErrServiceRequest
+	}
+	switch target.Path {
+	case "/api/app-services/openai/v1/images/generations", "/api/app-services/openai/v1/images/edits", "/api/app-services/openai/v1/responses":
+	default:
+		return nil, ErrServiceRequest
+	}
+	for name := range request.Header {
+		if !strings.EqualFold(name, "Accept") && !strings.EqualFold(name, "Content-Type") {
+			return nil, ErrServiceRequest
+		}
+	}
+	stored, err := c.readSession(headers)
+	if err != nil {
+		return nil, err
+	}
+	value, err := c.inspect(ctx, stored.Token)
+	if err != nil {
+		return nil, err
+	}
+	if value.Subject != stored.Subject || value.Expires != stored.Expires {
+		return nil, ErrUnauthenticated
+	}
+	outgoing := request.Clone(ctx)
+	if outgoing.Header == nil {
+		outgoing.Header = make(http.Header)
+	}
+	outgoing.Header.Set("Authorization", "Bearer "+stored.Token)
+	transport := *c.http
+	transport.Timeout = 10 * time.Minute
+	response, err := transport.Do(outgoing)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, errors.Join(ErrServiceUnavailable, context.Canceled)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, errors.Join(ErrServiceUnavailable, context.DeadlineExceeded)
+		}
+		return nil, ErrServiceUnavailable
+	}
+	if response.StatusCode >= 300 && response.StatusCode < 400 {
+		response.Body.Close()
+		return nil, ErrServiceUnavailable
+	}
+	// net/http otherwise returns the outbound Authorization header to the caller.
+	response.Request = request
+	return response, nil
 }
 
 // Logout always returns a clearing cookie, including when revocation cannot be
@@ -318,6 +389,24 @@ func trustedURL(raw string) (*url.URL, error) {
 		return nil, ErrConfiguration
 	}
 	return parsed, nil
+}
+
+func browserOrigin(raw string, allowed []string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || strings.ContainsAny(raw, "?#\\") {
+		return nil, ErrConfiguration
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	port, portErr := strconv.Atoi(parsed.Port())
+	if ip == nil || ip.To4() == nil || ip.String() != parsed.Hostname() || (!ip.IsPrivate() && !ip.IsLoopback()) || portErr != nil || port < 1 || port > 65535 || parsed.Port() != strconv.Itoa(port) {
+		return nil, ErrConfiguration
+	}
+	for _, origin := range allowed {
+		if origin == raw {
+			return parsed, nil
+		}
+	}
+	return nil, ErrConfiguration
 }
 
 func readSecret(path string, limit int64) ([]byte, error) {

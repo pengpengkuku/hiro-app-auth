@@ -2,6 +2,9 @@
 import base64
 import hashlib
 import json
+import os
+import tempfile
+from pathlib import Path
 import time
 import unittest
 from urllib.parse import parse_qs, quote_plus, urlencode, urlsplit
@@ -101,6 +104,78 @@ class AuthStoryTests(unittest.TestCase):
             auth.check(grant)
         with self.assertRaises(AuthError):
             auth.authenticate(headers)
+
+
+    def test_http_browser_with_https_backchannels(self):
+        identity = IdentityTransport()
+        app = "http://10.23.0.10:8081"
+        browser = "http://10.23.0.10:8080"
+        origins = (app, browser)
+        config = HostedConfig(identity.issuer, identity.client, identity.secret, app, origins, browser)
+        auth = HiroAuth(config, transport=identity)
+        location, pending = auth.login()
+        query = parse_qs(urlsplit(location).query)
+        self.assertEqual(location.split("/authorization")[0], browser)
+        self.assertEqual(query["redirect_uri"], [app + "/auth/callback"])
+        self.assertEqual(query["code_challenge_method"], ["S256"])
+        callback = "/auth/callback?" + urlencode({"code": "synthetic-code", "state": query["state"][0]})
+        headers = {"Cookie": pending.split(";", 1)[0]}
+        session = auth.callback(headers, callback)
+        with self.assertRaises(AuthError):
+            auth.callback(headers, callback)
+        token_request = next(request for request in identity.requests if request.url.endswith("/token"))
+        verifier = parse_qs(token_request.body)["code_verifier"][0]
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        self.assertEqual(query["code_challenge"], [challenge])
+        self.assertTrue(all(request.url.startswith(identity.issuer + "/") for request in identity.requests))
+        namespace = hashlib.sha256(identity.client.encode()).hexdigest()[:32]
+        self.assertTrue(session.startswith("hiro-app-" + namespace + "="))
+        self.assertIn("Path=/; HttpOnly; SameSite=Lax", session)
+        self.assertNotIn("Secure", session)
+        session_headers = {"Cookie": session.split(";", 1)[0]}
+        grant = auth.authenticate(session_headers)
+        other = HiroAuth(HostedConfig(identity.issuer, "other-app", identity.secret, app, origins, browser), transport=identity)
+        self.assertNotEqual(other.SESSION_COOKIE, auth.SESSION_COOKIE)
+        with self.assertRaises(AuthError):
+            other.authenticate(session_headers)
+        for change in ("state", "duplicate", "path", "origin", "fragment"):
+            location, cookie = auth.login()
+            state = parse_qs(urlsplit(location).query)["state"][0]
+            path = "/auth/callback?" + urlencode({"code": "synthetic-code", "state": "wrong" if change == "state" else state})
+            if change == "duplicate":
+                path += "&code=duplicate"
+            if change == "path":
+                path = path.replace("/auth/callback", "/wrong")
+            if change == "origin":
+                path = "http://10.23.0.10:8082" + path
+            if change == "fragment":
+                path += "#fragment"
+            with self.assertRaises(AuthError):
+                auth.callback({"Cookie": cookie.split(";", 1)[0]}, path)
+            with self.assertRaises(AuthError):
+                auth.callback({"Cookie": cookie.split(";", 1)[0]}, path)
+        identity.claim["active"] = False
+        with self.assertRaises(AuthError):
+            auth.check(grant)
+        self.assertNotIn("OAUTHLIB_INSECURE_TRANSPORT", os.environ)
+        for invalid in ("http://8.8.8.8:8081", "http://app.example:8081", app + "/", app + "?x", app + "#x",
+                        "http://user@10.23.0.10:8081", "http://10.027.0.10:8081"):
+            with self.assertRaises(ValueError):
+                HostedConfig(identity.issuer, identity.client, identity.secret, app, (*origins, invalid), browser)
+        with self.assertRaises(ValueError):
+            HostedConfig(identity.issuer, identity.client, identity.secret, app)
+        with self.assertRaises(ValueError):
+            HostedConfig(browser, identity.client, identity.secret, app, origins, browser)
+        with tempfile.TemporaryDirectory() as directory:
+            secret_file = Path(directory) / "secret"
+            secret_file.write_text(identity.secret, encoding="utf-8")
+            env = {"HIRO_MANAGED": "true", "APP_AUTH_ISSUER": identity.issuer,
+                   "APP_AUTH_CLIENT_ID": identity.client, "APP_AUTH_CLIENT_SECRET_FILE": str(secret_file),
+                   "APP_PUBLIC_ORIGIN": app, "APP_AUTH_HTTP_ORIGINS": json.dumps(origins), "APP_AUTH_BROWSER_ORIGIN": browser}
+            self.assertEqual(HostedConfig.from_environment(env), config)
+            for invalid in ("null", "{}", '[1]'):
+                with self.assertRaises(ValueError):
+                    HostedConfig.from_environment({**env, "APP_AUTH_HTTP_ORIGINS": invalid})
 
 
 if __name__ == "__main__":

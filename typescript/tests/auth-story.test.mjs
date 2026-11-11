@@ -23,38 +23,50 @@ const formEncode = (value) => new URLSearchParams({ v: value }).toString().slice
 const status = (expected) => (error) => error instanceof AuthError && error.status === expected
   && !error.message.includes(config.clientSecret) && !error.message.includes('access-token');
 
-function provider() {
+function provider(settings = config) {
+  const discovery = Object.fromEntries(Object.entries(metadata).map(([name, value]) => [name, value.replace(config.issuer, settings.issuer)]));
   const state = {
-    introspection: { active: true, sub: 'person-1', client_id: config.clientId,
-      aud: 'urn:hiro:app:' + config.clientId, exp: expiry, scope: 'openid hiro.app', iss: config.issuer },
+    introspection: { active: true, sub: 'person-1', client_id: settings.clientId,
+      aud: 'urn:hiro:app:' + settings.clientId, exp: expiry, scope: 'openid hiro.app', iss: settings.issuer },
     userInfo: { sub: 'person-1' }, calls: [], challenge: '', revokeUnavailable: false,
+    token: 'access-token', serviceRequests: [], async serviceReply() { return json({ data: 'x'.repeat(40000), usage: { total_tokens: 1 } }); },
     async beforeIntrospection() {},
     async beforeToken() {},
   };
   state.fetch = async (input, init = {}) => {
     const url = new URL(input instanceof Request ? input.url : input);
+    if (input instanceof Request) init = { redirect: input.redirect, signal: input.signal, headers: input.headers };
     assert.equal(init.redirect, 'manual');
     assert.ok(init.signal instanceof AbortSignal);
     state.calls.push(url.pathname);
-    if (url.pathname.endsWith('/openid-configuration')) return json(metadata);
+    if (url.pathname.startsWith('/api/app-services/')) {
+      assert.ok(input instanceof Request);
+      assert.equal(input.credentials, 'omit');
+      assert.equal(input.referrer, '');
+      assert.equal(input.headers.get('authorization'), 'Bearer ' + state.token);
+      assert.equal(input.headers.get('cookie'), null);
+      state.serviceRequests.push(input);
+      return state.serviceReply(input);
+    }
+    if (url.pathname.endsWith('/openid-configuration')) return json(discovery);
     if (['/token', '/introspect', '/revoke'].includes(url.pathname)) {
-      const basic = Buffer.from(formEncode(config.clientId) + ':' + formEncode(config.clientSecret)).toString('base64');
+      const basic = Buffer.from(formEncode(settings.clientId) + ':' + formEncode(settings.clientSecret)).toString('base64');
       assert.equal(new Headers(init.headers).get('authorization'), 'Basic ' + basic);
       const body = new URLSearchParams(init.body);
       if (url.pathname === '/token') {
         await state.beforeToken();
-        assert.equal(body.get('redirect_uri'), config.publicOrigin + '/auth/callback');
+        assert.equal(body.get('redirect_uri'), settings.publicOrigin + '/auth/callback');
         assert.equal(body.get('grant_type'), 'authorization_code');
         assert.equal(createHash('sha256').update(body.get('code_verifier')).digest('base64url'), state.challenge);
-        return json({ access_token: 'access-token', token_type: 'Bearer', expires_in: 3600 });
+        return json({ access_token: state.token, token_type: 'Bearer', expires_in: 3600 });
       }
-      assert.equal(body.get('token'), 'access-token');
+      assert.equal(body.get('token'), state.token);
       if (url.pathname === '/revoke') return state.revokeUnavailable ? json({}, 503) : new Response(null, { status: 200 });
       await state.beforeIntrospection();
       return json(state.introspection);
     }
     if (url.pathname === '/userinfo') {
-      assert.equal(new Headers(init.headers).get('authorization'), 'Bearer access-token');
+      assert.equal(new Headers(init.headers).get('authorization'), 'Bearer ' + state.token);
       return json(state.userInfo);
     }
     throw new Error('Unexpected upstream URL');
@@ -62,14 +74,14 @@ function provider() {
   return state;
 }
 
-async function signedIn(state = provider()) {
-  const auth = await createHiroAuth(config, { fetch: state.fetch });
+async function signedIn(state = provider(), instance, settings = config) {
+  const auth = instance ?? await createHiroAuth(settings, { fetch: state.fetch });
   const login = await auth.login();
   const location = new URL(login.location);
   assert.equal(location.searchParams.get('scope'), 'openid hiro.app');
   assert.equal(location.searchParams.get('code_challenge_method'), 'S256');
   state.challenge = location.searchParams.get('code_challenge');
-  const callbackUrl = new URL('/auth/callback', config.publicOrigin);
+  const callbackUrl = new URL('/auth/callback', settings.publicOrigin);
   callbackUrl.searchParams.set('code', 'authorization-code');
   callbackUrl.searchParams.set('state', location.searchParams.get('state'));
   const pendingHeaders = cookieHeaders(login.setCookies);
@@ -234,4 +246,125 @@ test('logout during token exchange prevents callback from creating a session', a
   await assert.rejects(callback, status(401));
   await assert.rejects(auth.callback(headers, url), status(401));
   await assert.rejects(auth.requireUser(headers), status(401));
+});
+
+test('the signed-in user calls exact workbench services with native bodies and no credential escape', async () => {
+  const { auth, state, result } = await signedIn();
+  const base = config.issuer + '/api/app-services/openai/v1/';
+  const request = new Request(base + 'images/generations', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"model":"gpt-image-2"}',
+  });
+  const response = await auth.serviceRequest(result.principal, request);
+  assert.equal((await response.json()).data.length, 40000);
+  assert.equal(await state.serviceRequests[0].text(), '{"model":"gpt-image-2"}');
+  assert.equal(request.headers.get('authorization'), null);
+  assert.equal(request.redirect, 'follow');
+  await assert.rejects(auth.serviceRequest(result.principal, request), TypeError);
+  const form = new FormData();
+  form.set('model', 'gpt-image-2');
+  form.set('image', new Blob(['synthetic image'], { type: 'image/png' }), 'example.png');
+  await auth.serviceRequest(result.principal, new Request(base + 'images/edits', { method: 'POST', body: form }));
+  const sent = await state.serviceRequests[1].formData();
+  assert.equal(await sent.get('image').text(), 'synthetic image');
+  const fresh = (url = base + 'responses', headers = {}) => new Request(url, { method: 'POST', headers });
+  state.token = 'access-token-b';
+  state.introspection.sub = 'person-2';
+  state.userInfo.sub = 'person-2';
+  const userB = await signedIn(state, auth);
+  await auth.serviceRequest(userB.result.principal, fresh());
+  assert.equal(state.serviceRequests.at(-1).headers.get('authorization'), 'Bearer access-token-b');
+  state.token = 'access-token';
+  state.introspection.sub = 'person-1';
+  state.userInfo.sub = 'person-1';
+  await auth.serviceRequest(result.principal, fresh());
+  assert.equal(state.serviceRequests.at(-1).headers.get('authorization'), 'Bearer access-token');
+
+  const before = state.serviceRequests.length;
+  for (const wrong of [
+    'https://attacker.example/api/app-services/openai/v1/responses',
+    base + 'responses?user=other', base + 'responses#fragment', base + 'unknown',
+  ]) await assert.rejects(auth.serviceRequest(result.principal, fresh(wrong)), TypeError);
+  assert.throws(() => fresh('https://user:secret@hiro.example/api/app-services/openai/v1/responses'), TypeError);
+  for (const name of ['Authorization', 'Cookie', 'X-User-Id', 'X-App-Id', 'OpenAI-Organization', 'Host']) {
+    await assert.rejects(auth.serviceRequest(result.principal, fresh(undefined, { [name]: 'override' })), TypeError);
+  }
+  await assert.rejects(auth.serviceRequest(result.principal, new Request(base + 'responses')), TypeError);
+  await assert.rejects(auth.serviceRequest({ ...result.principal }, fresh()), status(401));
+  const other = await signedIn();
+  await assert.rejects(other.auth.serviceRequest(result.principal, fresh()), status(401));
+  assert.equal(state.serviceRequests.length, before);
+  state.introspection.sub = 'different-user';
+  await assert.rejects(auth.serviceRequest(result.principal, fresh()), status(401));
+  assert.equal(state.serviceRequests.length, before);
+  const current = await signedIn();
+  current.state.serviceReply = async () => Response.redirect('https://attacker.example', 307);
+  await assert.rejects(current.auth.serviceRequest(current.result.principal, fresh()), /redirect refused/u);
+  assert.equal(current.state.serviceRequests.length, 1);
+  current.state.serviceReply = async () => new Response('native error', { status: 429 });
+  const rejected = await current.auth.serviceRequest(current.result.principal, fresh());
+  assert.equal(rejected.status, 429);
+  assert.equal(await rejected.text(), 'native error');
+  const controller = new AbortController();
+  current.state.serviceReply = async (input) => {
+    assert.equal(input.signal.aborted, true);
+    input.signal.throwIfAborted();
+  };
+  controller.abort();
+  await assert.rejects(current.auth.serviceRequest(current.result.principal,
+    new Request(base + 'responses', { method: 'POST', signal: controller.signal })), { name: 'AbortError' });
+  await current.auth.logout(current.headers);
+  const count = current.state.serviceRequests.length;
+  await assert.rejects(current.auth.serviceRequest(current.result.principal, fresh()), status(401));
+  assert.equal(current.state.serviceRequests.length, count);
+});
+
+
+test('explicit HTTP browser origins preserve HTTPS OAuth backchannels and app cookie isolation', async () => {
+  const settings = { ...config, publicOrigin: 'http://10.23.0.10:8081', browserOrigin: 'http://10.23.0.10:8080',
+    httpOrigins: ['http://10.23.0.10:8081', 'http://10.23.0.10:8080'] };
+  const state = provider(settings);
+  const fetch = async (input, init) => {
+    assert.equal(new URL(input instanceof Request ? input.url : input).origin, config.issuer);
+    return state.fetch(input, init);
+  };
+  const auth = await createHiroAuth(settings, { fetch });
+  const login = await auth.login();
+  assert.equal(new URL(login.location).origin, settings.browserOrigin);
+  assert.equal(new URL(login.location).searchParams.get('redirect_uri'), settings.publicOrigin + '/auth/callback');
+  const current = await signedIn(state, auth, settings);
+  assert.equal(await auth.requireUser(current.headers), current.result.principal);
+  await auth.serviceRequest(current.result.principal, new Request(config.issuer + '/api/app-services/openai/v1/responses', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input: 'synthetic' }),
+  }));
+  assert.equal(state.serviceRequests.length, 1);
+  const prefix = 'hiro-app-' + createHash('sha256').update(settings.clientId).digest('hex').slice(0, 32);
+  assert.match(current.result.setCookies[1], new RegExp('^' + prefix + '=.*; Path=/; HttpOnly; SameSite=Lax$'));
+  assert.deepEqual(clearPendingCookies(settings), [prefix + '-pending=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0']);
+  const other = { ...settings, clientId: 'other-app', publicOrigin: 'http://10.23.0.10:8082',
+    httpOrigins: [...settings.httpOrigins, 'http://10.23.0.10:8082'] };
+  const otherAuth = await createHiroAuth(other, { fetch: provider(other).fetch });
+  assert.notEqual((await otherAuth.login()).setCookies[0].split('=')[0], login.setCookies[0].split('=')[0]);
+  await assert.rejects(otherAuth.requireUser(current.headers), status(401));
+  for (const patch of [{ httpOrigins: [] },
+    { publicOrigin: 'http://10.23.0.10', httpOrigins: [...settings.httpOrigins, 'http://10.23.0.10'] },
+    { issuer: settings.browserOrigin }, { browserOrigin: 'http://10.23.0.11:8080' },
+    ...['http://8.8.8.8:8081', 'http://app.example:8081', 'http://10.23.0.10:8081/',
+      'http://10.23.0.10:8081?x', 'http://10.23.0.10:8081#x', 'http://user@10.23.0.10:8081',
+      'http://0x0a17000a:8081', 'http://10.027.0.10:8081'].map((origin) => ({ httpOrigins: [origin] }))]) {
+    await assert.rejects(createHiroAuth({ ...settings, ...patch }, { fetch: state.fetch }));
+  }
+  for (const kind of ['state', 'duplicate', 'origin', 'path']) {
+    const attempt = await auth.login();
+    const url = new URL(settings.publicOrigin + '/auth/callback');
+    url.searchParams.set('code', 'synthetic-code');
+    url.searchParams.set('state', new URL(attempt.location).searchParams.get('state'));
+    if (kind === 'state') url.searchParams.set('state', 'wrong');
+    if (kind === 'duplicate') url.searchParams.append('code', 'duplicate');
+    if (kind === 'origin') url.port = '8082';
+    if (kind === 'path') url.pathname = '/wrong';
+    await assert.rejects(auth.callback(cookieHeaders(attempt.setCookies), url), status(401));
+    await assert.rejects(auth.callback(cookieHeaders(attempt.setCookies), url), status(401));
+  }
+  const logout = await auth.logout(current.headers);
+  assert.ok(logout.setCookies.every((cookie) => cookie.startsWith(prefix) && cookie.includes('Max-Age=0') && !cookie.includes('Secure')));
 });

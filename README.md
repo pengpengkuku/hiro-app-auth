@@ -19,19 +19,19 @@ The SDKs verify the native opaque-token profile through online introspection. Th
 TypeScript on Node.js 22.12+:
 
 ```sh
-npm install https://github.com/pengpengkuku/hiro-app-auth/releases/download/typescript-v0.1.0/hiro-app-auth-0.1.0.tgz
+npm install https://github.com/pengpengkuku/hiro-app-auth/releases/download/typescript-v0.2.0/hiro-app-auth-0.2.0.tgz
 ```
 
 Python 3.11+:
 
 ```sh
-python -m pip install 'hiro-app-auth @ git+https://github.com/pengpengkuku/hiro-app-auth.git@python-v0.1.0#subdirectory=python'
+python -m pip install 'hiro-app-auth @ git+https://github.com/pengpengkuku/hiro-app-auth.git@python-v0.2.0#subdirectory=python'
 ```
 
 Go 1.26+:
 
 ```sh
-go get github.com/pengpengkuku/hiro-app-auth@v0.1.1
+go get github.com/pengpengkuku/hiro-app-auth@v0.2.0
 ```
 
 Pin a full reviewed commit for reproducible builds. TypeScript packages and Python wheels are attached to their GitHub releases. Neither package is published to a package registry.
@@ -44,6 +44,7 @@ Pin a full reviewed commit for reproducible builds. TypeScript packages and Pyth
 | Protected-request authorization | Online introspection | Online introspection | Online introspection |
 | Session storage | Process memory | Process memory | Encrypted host-only cookie |
 | Logout | Local removal and token revocation | Local removal and token revocation | Clearing cookie and token revocation |
+| Shared workbench service calls | Owned-principal request method | Native HTTP with checked grant | Owned-session request method |
 | User-owned resources and CSRF | Application responsibility | Application responsibility | Application responsibility |
 
 TypeScript and Python support one process per instance. A restart requires login; sessions are not shared across workers or replicas. All SDKs fail closed when authorization cannot be confirmed. They target Hiro's native profile, not arbitrary identity providers.

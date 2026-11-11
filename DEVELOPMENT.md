@@ -23,7 +23,7 @@ Each application keeps its own language, framework, and release process. These c
 Obtain these values from the platform operator before connecting. Example domains and IDs in this repository are not working platform registrations.
 
 - A stable application ID and the supported platform contract version.
-- An exact HTTPS issuer, public application origin, and registered callback URL.
+- An exact HTTPS issuer, public application origin, and registered callback URL. For an operator-approved private-network HTTP browser origin, use the chosen SDK's explicit HTTP configuration. Identity and shared-service backchannels retain HTTPS.
 - A confidential client ID and a read-only runtime secret file.
 - Application access grants for two test users, with a way to revoke one grant.
 - Approved runtime storage, network targets, resource limits, and release owner.
@@ -36,7 +36,7 @@ Choose [TypeScript](typescript/README.md), [Python](python/README.md), or [Go](G
 
 For TypeScript, start with the [Node HTTP example](typescript/examples/http-app.mjs). The SDK uses openid-client for the authorization-code and S256 PKCE flow. Install it only on the server. Tokens stay in process memory.
 
-For Python, start with the [HTTP example](python/examples/http_app.py). It includes login, callback, a protected identity response, and logout. It is a single-process integration example behind HTTPS, not a production web server or a complete business application.
+For Python, start with the [HTTP example](python/examples/http_app.py). It includes login, callback, a protected identity response, and logout. It is a single-process integration example, not a production web server or a complete business application.
 
 For Go, keep the existing trusted OAuth callback and pass its validated opaque access token to `BindSession`. The application retains responsibility for state, nonce where applicable, PKCE, and callback validation.
 
@@ -47,6 +47,43 @@ For all SDKs:
 3. Use the verified issuer and subject as the stable owner. A platform administrator does not automatically own user content.
 4. Reject failed authorization. Do not fall back to a public user, a local account, or an earlier successful permission check.
 5. Always send clearing cookies on logout, even if upstream revocation cannot be confirmed. Reset old page state and open connections. Ending the app session does not claim to end Hiro's main session.
+
+## Private-network HTTP browser origins
+
+HTTPS remains the default. When the platform operator approves HTTP inside a private network, keep the issuer and every credential-bearing identity or shared-service call on HTTPS. Only browser navigation and the application's own host-only cookie use the approved HTTP origin. Applications do not configure employee certificate trust.
+
+Example values below are synthetic. Obtain the actual values from the operator:
+
+```text
+APP_AUTH_ISSUER=https://identity.example/oidc
+APP_PUBLIC_ORIGIN=http://10.23.0.10:8081
+APP_AUTH_HTTP_ORIGINS=["http://10.23.0.10:8080","http://10.23.0.10:8081"]
+APP_AUTH_BROWSER_ORIGIN=http://10.23.0.10:8080
+```
+
+TypeScript `loadConfig` and Python `HostedConfig.from_environment` load these settings. Direct callers use `httpOrigins` and `browserOrigin` in TypeScript, or `http_origins` and `browser_origin` in Python. The public origin must exactly match an allowlisted canonical private IPv4 address with an explicit port. Public IPs, hostnames, aliases, paths, queries, and fragments are rejected in the allowlist.
+
+Go callers pass the application origin and allowlist through `Config.PublicOrigin` and `Config.HTTPOrigins`. The Go SDK does not own the OAuth callback. The application's existing OAuth flow must construct browser authorization navigation with the operator-approved Hiro origin while retaining the original HTTPS token and userinfo endpoints.
+
+HTTP cookies omit `Secure` and use names derived from the application client ID. They remain host-only, `HttpOnly`, and `SameSite=Lax`. Cookies are not isolated by port: two deployments of the same client on the same host can overwrite cookies. Keep their browser hosts or browser profiles separate when concurrent sessions are required. The application still validates Host, Origin, CSRF, and per-user resource ownership.
+
+## Call shared workbench services
+
+When the platform enables shared OpenAI services, it supplies `APP_SERVICE_OPENAI_BASE_URL`, for example `https://hiro.example/api/app-services/openai/v1`. The base must equal the authentication issuer's exact origin plus `/api/app-services/openai/v1`, even when the issuer has a path such as `/oidc`.
+
+Use the current user's existing server-side access token. Hiro determines the user and application from that token and selects the application's bound company connection. Applications never receive the supplier key. Do not forward browser headers, select a connection through headers, or submit a user or application ID as authority.
+
+The current workbench service supports these operations below that base:
+
+| Operation | Supported request scope |
+|---|---|
+| `POST /images/generations` | JSON image generation requests. |
+| `POST /images/edits` | Multipart uploads containing the image bytes. JSON edits are rejected. |
+| `POST /responses` | Stateless JSON requests with `input_text` and inline `input_image` content. Provider response IDs, provider file IDs, and tools are rejected. Hiro forces `store=false`. |
+
+Hiro deliberately excludes provider-stored resources because applications share company keys and must not access another user's provider resources. Read the native service response and keep files and business records in the application. Follow the [TypeScript](typescript/README.md#call-workbench-services), [Python](python/REFERENCE.md#call-workbench-services), or [Go](GO.md#call-workbench-services) instructions for token handling and timeouts.
+
+These calls have no automatic retry. A timeout, disconnect, or cancellation can leave the supplier outcome unknown. Report that uncertainty without resubmitting paid work. A logout or revoked permission prevents subsequent accepted calls but cannot undo work the supplier has already received. The application still owns CSRF, uploads, resource limits, cancellation, and result ownership.
 
 ## 3. Keep each user's data private
 

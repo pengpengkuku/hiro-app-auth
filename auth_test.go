@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +25,11 @@ func TestAuthorizationJourney(t *testing.T) {
 	state := "valid"
 	expires := time.Now().Add(time.Hour).Unix()
 	checks := 0
+	serviceCalls := 0
+	leaked := false
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { mu.Lock(); leaked = true; mu.Unlock() }))
+	defer attacker.Close()
+	serviceStarted := make(chan struct{})
 	var issuer string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -31,6 +37,28 @@ func TestAuthorizationJourney(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/oidc/.well-known/openid-configuration" {
 			json.NewEncoder(w).Encode(map[string]string{"issuer": issuer, "introspection_endpoint": issuer + "/inspect", "revocation_endpoint": issuer + "/revoke"})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/app-services/") {
+			serviceCalls++
+			if r.Header.Get("Authorization") != "Bearer synthetic-opaque-access-token" || r.Header.Get("Cookie") != "" || r.Method != http.MethodPost {
+				t.Error("service did not receive only the current user's native token")
+			}
+			body, _ := io.ReadAll(r.Body)
+			if string(body) != "synthetic native payload" {
+				t.Error("service body changed")
+			}
+			if state == "service-cancel" {
+				close(serviceStarted)
+				<-r.Context().Done()
+				return
+			}
+			if state == "service-redirect" {
+				w.Header().Set("Location", attacker.URL)
+				w.WriteHeader(http.StatusTemporaryRedirect)
+				return
+			}
+			w.Write([]byte(strings.Repeat("x", 40000)))
 			return
 		}
 		user, password, ok := r.BasicAuth()
@@ -114,6 +142,74 @@ func TestAuthorizationJourney(t *testing.T) {
 	if observedChecks != 2 {
 		t.Fatalf("expected callback and protected request to introspect, got %d", observedChecks)
 	}
+	serviceURL := server.URL + "/api/app-services/openai/v1/"
+	serviceRequest := func(endpoint string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader("synthetic native payload"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Content-Type", "multipart/form-data; boundary=synthetic")
+		return r
+	}
+	for _, endpoint := range []string{"images/generations", "images/edits", "responses"} {
+		r := serviceRequest(serviceURL + endpoint)
+		response, err := client.ServiceRequest(ctx, headers, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || len(body) != 40000 || response.StatusCode != 200 {
+			t.Fatal("native service response was truncated")
+		}
+		if r.Header.Get("Authorization") != "" || response.Request.Header.Get("Authorization") != "" {
+			t.Fatal("outbound credential escaped into caller request")
+		}
+	}
+	for _, endpoint := range []string{attacker.URL + "/api/app-services/openai/v1/responses", serviceURL + "responses?user=other", serviceURL + "responses#fragment", serviceURL + "unknown", issuer + "/api/app-services/openai/v1/responses"} {
+		if _, err := client.ServiceRequest(ctx, headers, serviceRequest(endpoint)); !errors.Is(err, appauth.ErrServiceRequest) {
+			t.Fatal("invalid service target accepted")
+		}
+	}
+	for _, name := range []string{"Authorization", "Cookie", "X-User-Id", "X-App-Id", "OpenAI-Organization", "Host"} {
+		r := serviceRequest(serviceURL + "responses")
+		r.Header.Set(name, "override")
+		if _, err := client.ServiceRequest(ctx, headers, r); !errors.Is(err, appauth.ErrServiceRequest) {
+			t.Fatal("caller service override accepted")
+		}
+	}
+	wrongHost := serviceRequest(serviceURL + "responses")
+	wrongHost.Host = "attacker.example"
+	if _, err := client.ServiceRequest(ctx, headers, wrongHost); !errors.Is(err, appauth.ErrServiceRequest) {
+		t.Fatal("Host override accepted")
+	}
+	mu.Lock()
+	state = "service-redirect"
+	mu.Unlock()
+	if _, err := client.ServiceRequest(ctx, headers, serviceRequest(serviceURL+"responses")); !errors.Is(err, appauth.ErrServiceUnavailable) {
+		t.Fatal("service redirect accepted")
+	}
+	mu.Lock()
+	state = "service-cancel"
+	mu.Unlock()
+	cancelContext, cancelService := context.WithCancel(ctx)
+	serviceDone := make(chan error, 1)
+	go func() {
+		_, err := client.ServiceRequest(cancelContext, headers, serviceRequest(serviceURL+"responses"))
+		serviceDone <- err
+	}()
+	<-serviceStarted
+	cancelService()
+	if err := <-serviceDone; !errors.Is(err, context.Canceled) || !errors.Is(err, appauth.ErrServiceUnavailable) {
+		t.Fatal("service cancellation did not retain context cancellation and unknown outcome")
+	}
+	mu.Lock()
+	state = "valid"
+	observedLeak := leaked
+	mu.Unlock()
+	if observedLeak {
+		t.Fatal("service credential followed redirect or wrong origin")
+	}
 	for _, scenario := range []struct {
 		state string
 		want  error
@@ -126,6 +222,20 @@ func TestAuthorizationJourney(t *testing.T) {
 			mu.Unlock()
 			if _, err := client.RequireUser(ctx, headers); !errors.Is(err, scenario.want) {
 				t.Fatalf("got %v, want %v", err, scenario.want)
+			}
+			if scenario.state == "wrong-sub" {
+				mu.Lock()
+				before := serviceCalls
+				mu.Unlock()
+				if _, err := client.ServiceRequest(ctx, headers, serviceRequest(serviceURL+"responses")); !errors.Is(err, scenario.want) {
+					t.Fatalf("service authorization got %v, want %v", err, scenario.want)
+				}
+				mu.Lock()
+				after := serviceCalls
+				mu.Unlock()
+				if after != before {
+					t.Fatal("unconfirmed identity reached paid service")
+				}
 			}
 		})
 	}
@@ -216,6 +326,26 @@ func TestTrustBoundaries(t *testing.T) {
 	if err != nil || client == nil {
 		t.Fatalf("literal loopback must support local development: %v", err)
 	}
+	config.PublicOrigin = "http://10.23.0.10:8081"
+	if _, err := appauth.New(config); !errors.Is(err, appauth.ErrConfiguration) {
+		t.Fatal("unlisted private browser origin accepted")
+	}
+	config.HTTPOrigins = []string{config.PublicOrigin}
+	if _, err := appauth.New(config); err != nil {
+		t.Fatalf("explicit private browser origin rejected: %v", err)
+	}
+	for _, raw := range []string{"http://192.0.2.1:8081", "http://app.invalid:8081", "http://10.027.0.10:8081", config.PublicOrigin + "/", config.PublicOrigin + "?", config.PublicOrigin + "#", "http://user@10.23.0.10:8081"} {
+		config.HTTPOrigins = []string{config.PublicOrigin, raw}
+		if _, err := appauth.New(config); !errors.Is(err, appauth.ErrConfiguration) {
+			t.Fatalf("invalid HTTP browser origin accepted: %q", raw)
+		}
+	}
+	config.HTTPOrigins = []string{config.PublicOrigin}
+	config.Issuer = config.PublicOrigin
+	if _, err := appauth.New(config); !errors.Is(err, appauth.ErrConfiguration) {
+		t.Fatal("browser allowlist authorized HTTP backchannel")
+	}
+	config.Issuer = server.URL + "/oidc"
 	config.CookieKeyFile = filepath.Join(t.TempDir(), "missing")
 	if _, err := appauth.New(config); !errors.Is(err, appauth.ErrConfiguration) || strings.Contains(err.Error(), config.CookieKeyFile) {
 		t.Fatal("missing runtime key must fail without exposing configuration values")

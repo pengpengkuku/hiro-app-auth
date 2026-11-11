@@ -54,7 +54,7 @@ const server = createServer(async (request, response) => {
       send(404, 'Not found.');
     }
   } catch (error) {
-    if (url.pathname === '/auth/callback') response.setHeader('Set-Cookie', clearPendingCookies());
+    if (url.pathname === '/auth/callback') response.setHeader('Set-Cookie', clearPendingCookies(config));
     send(error instanceof AuthError ? error.status : 503,
       error instanceof AuthError ? error.message : 'The application could not complete the request.');
   }

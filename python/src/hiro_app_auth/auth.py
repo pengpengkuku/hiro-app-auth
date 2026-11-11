@@ -1,11 +1,14 @@
 """Hiro app login. Tokens and PKCE state live only in server memory."""
 import secrets
+import hashlib
+import ipaddress
+import json
 import threading
 import time
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie, CookieError
 from pathlib import Path
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import parse_qs, quote_plus, urlsplit
 
 
 class AuthError(Exception):
@@ -24,16 +27,48 @@ def https_url(value):
     return parsed
 
 
+def browser_url(value, http_origins=()):
+    if not isinstance(value, str) or any(ord(char) < 33 or ord(char) == 127 for char in value) or any(char in value for char in "\\?#"):
+        raise ValueError("Invalid browser URL.")
+    parsed = urlsplit(value)
+    if parsed.scheme == "https":
+        return https_url(value)
+    try:
+        address = ipaddress.IPv4Address(parsed.hostname)
+        private = any(address in ipaddress.ip_network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"))
+        if (parsed.scheme != "http" or not private or parsed.hostname != str(address)
+                or parsed.username is not None or parsed.password is not None or not parsed.port
+                or parsed.netloc != str(address) + ":" + str(parsed.port)
+                or "http://" + parsed.netloc not in http_origins):
+            raise ValueError("Unapproved HTTP origin.")
+    except (ValueError, TypeError):
+        raise ValueError("Unapproved HTTP origin.") from None
+    return parsed
+
+
 @dataclass(frozen=True)
 class HostedConfig:
     issuer: str
     client_id: str
     client_secret: str = field(repr=False)
     public_origin: str
+    http_origins: tuple[str, ...] = ()
+    browser_origin: str | None = None
 
     def __post_init__(self):
         https_url(self.issuer)
-        origin = https_url(self.public_origin)
+        if not isinstance(self.http_origins, (tuple, list)):
+            raise ValueError("Invalid HTTP origins.")
+        object.__setattr__(self, "http_origins", tuple(self.http_origins))
+        for value in self.http_origins:
+            parsed = browser_url(value, self.http_origins)
+            if parsed.scheme != "http" or value != "http://" + parsed.netloc or parsed.path:
+                raise ValueError("Invalid HTTP origin.")
+        origin = browser_url(self.public_origin, self.http_origins)
+        if self.browser_origin is not None:
+            browser = browser_url(self.browser_origin, self.http_origins)
+            if browser.scheme != "http" or self.browser_origin != "http://" + browser.netloc or browser.path:
+                raise ValueError("Invalid browser origin.")
         if (origin.path or self.issuer.endswith("/") or not self.client_id.strip() or len(self.client_id) > 256
                 or not self.client_secret or any(ord(char) < 32 for char in self.client_id + self.client_secret)):
             raise ValueError("Invalid hosted authentication configuration.")
@@ -42,12 +77,15 @@ class HostedConfig:
     def from_environment(cls, environment):
         names = ("APP_AUTH_ISSUER", "APP_AUTH_CLIENT_ID", "APP_AUTH_CLIENT_SECRET_FILE", "APP_PUBLIC_ORIGIN")
         managed = environment.get("HIRO_MANAGED")
-        if managed is None and not any(name in environment for name in names):
+        if managed is None and not any(name in environment for name in (*names, "APP_AUTH_HTTP_ORIGINS", "APP_AUTH_BROWSER_ORIGIN")):
             return None
         if managed != "true" or not all(environment.get(name) for name in names):
             raise ValueError("Hosted authentication configuration is incomplete; HIRO_MANAGED=true is required.")
         secret = Path(environment[names[2]]).read_text(encoding="utf-8").rstrip("\r\n")
-        return cls(environment[names[0]], environment[names[1]], secret, environment[names[3]])
+        origins = json.loads(environment.get("APP_AUTH_HTTP_ORIGINS", "[]"))
+        if not isinstance(origins, list) or not all(isinstance(value, str) for value in origins):
+            raise ValueError("APP_AUTH_HTTP_ORIGINS must be a JSON string array.")
+        return cls(environment[names[0]], environment[names[1]], secret, environment[names[3]], tuple(origins), environment.get("APP_AUTH_BROWSER_ORIGIN"))
 
 
 @dataclass(frozen=True)
@@ -107,6 +145,11 @@ class HiroAuth:
                 return super().send(request, **kwargs)
 
         self.config = config
+        self.secure = urlsplit(config.public_origin).scheme == "https"
+        if not self.secure:
+            namespace = hashlib.sha256(config.client_id.encode()).hexdigest()[:32]
+            self.SESSION_COOKIE = "hiro-app-" + namespace
+            self.PENDING_COOKIE = "hiro-app-" + namespace + "-pending"
         self.oauth_type = BoundedOAuth
         self.oauth_error = OAuth2Error
         self.basic = HTTPBasicAuth(quote_plus(config.client_id), quote_plus(config.client_secret))
@@ -128,9 +171,8 @@ class HiroAuth:
         except Exception:
             raise ValueError("Hiro discovery is unavailable or invalid.") from None
 
-    @staticmethod
-    def cookie(name, value, *, clear=False):
-        return f"{name}={value}; Path=/; Secure; HttpOnly; SameSite=Lax" + ("; Max-Age=0" if clear else "")
+    def cookie(self, name, value, *, clear=False):
+        return f"{name}={value}; Path=/;" + (" Secure;" if self.secure else "") + " HttpOnly; SameSite=Lax" + ("; Max-Age=0" if clear else "")
 
     @staticmethod
     def cookie_value(headers, name):
@@ -153,6 +195,9 @@ class HiroAuth:
     def login(self):
         oauth = self.oauth_type(self.config.client_id, redirect_uri=self.config.public_origin + "/auth/callback", scope=["openid", "hiro.app"], pkce="S256")
         url, _ = oauth.authorization_url(self.endpoints["authorization_endpoint"])
+        if self.config.browser_origin is not None:
+            authorization = urlsplit(url)
+            url = self.config.browser_origin + authorization.path + "?" + authorization.query
         pending_id = secrets.token_urlsafe(32)
         with self.lock:
             self.cleanup()
@@ -169,7 +214,17 @@ class HiroAuth:
         if pending is None:
             raise AuthError()
         try:
-            token = pending[1].fetch_token(self.endpoints["token_endpoint"], authorization_response=self.config.public_origin + path, auth=self.basic)
+            callback = urlsplit(self.config.public_origin + path)
+            query = parse_qs(callback.query, keep_blank_values=True)
+            origin = urlsplit(self.config.public_origin)
+            oauth = pending[1]
+            if (not path.startswith("/auth/callback?") or callback.path != "/auth/callback"
+                    or (callback.scheme, callback.netloc) != (origin.scheme, origin.netloc) or callback.fragment
+                    or len(query.get("code", [])) != 1 or not query["code"][0]
+                    or len(query.get("state", [])) != 1 or not secrets.compare_digest(query["state"][0].encode(), oauth._state.encode())
+                    or "error" in query):
+                raise AuthError()
+            token = oauth.fetch_token(self.endpoints["token_endpoint"], code=query["code"][0], auth=self.basic)
             access_token = token.get("access_token")
             if not isinstance(access_token, str) or not access_token or len(access_token) > 16384:
                 raise AuthError()

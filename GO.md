@@ -1,8 +1,8 @@
 # hiro-app-auth
 
-The Go SDK is licensed under Apache-2.0. It targets Go 1.26. Version v0.1.1 uses the published module identity `github.com/pengpengkuku/hiro-app-auth`. The earlier local v0.1.0 source used a provisional module path; existing vendored consumers can retain that fixed source until they choose to upgrade.
+The Go SDK is licensed under Apache-2.0. It targets Go 1.26. Version v0.2.0 uses the published module identity `github.com/pengpengkuku/hiro-app-auth`. The earlier local v0.1.0 source used a provisional module path; existing vendored consumers can retain that fixed source until they choose to upgrade.
 
-A standard-library-only Go SDK for the approved Hiro native opaque-token profile. The source targets Go 1.26 and is suitable for a Go 1.27.2 consumer. Validation must state the actual toolchain used. There are no downloaded modules, identity signing keys, account database or token cache.
+A standard-library-only Go SDK for the approved Hiro native opaque-token profile. The source targets Go 1.26. Consuming applications validate their own toolchain. There are no downloaded modules, identity signing keys, account database or token cache.
 
 ## Runtime configuration
 
@@ -20,9 +20,9 @@ client, err := appauth.New(appauth.Config{
 
 Import the package as `appauth "github.com/pengpengkuku/hiro-app-auth"`. All five strings are required. Keep the secret and exactly 32 cryptographically random cookie-key bytes in separately mounted runtime files readable only by the application. The client secret is UTF-8 text with an optional trailing CR/LF newline. The cookie key is raw binary, not base64 text. Deployments own generation, protection and rotation. Restart the app to load changed files; rotating the cookie key invalidates existing app cookies. Never print secret contents, tokens, cookies or upstream response bodies.
 
-Issuer must exactly match discovery's issuer. Discovery is fetched from `<issuer>/.well-known/openid-configuration`. Discovered introspection and revocation endpoints must share the issuer's scheme and host/port; queries, URL credentials, fragments and redirects are rejected. HTTPS is required except for a literal loopback IP (`127.0.0.1` or `::1`) during local development. A hostname such as `localhost` is not a literal IP. PublicOrigin is an origin, without a path. Local HTTP probes do not prove HTTPS deployment readiness.
+Issuer must exactly match discovery's issuer. Discovery is fetched from `<issuer>/.well-known/openid-configuration`. Discovered introspection and revocation endpoints must share the issuer's scheme and host/port; queries, URL credentials, fragments and redirects are rejected. HTTPS is required except for a literal loopback IP (`127.0.0.1` or `::1`) during local development. A hostname such as `localhost` is not a literal IP. PublicOrigin is an origin, without a path. An approved private-IP HTTP browser origin also requires the explicit `HTTPOrigins` configuration in the [HTTP deployment guide](DEVELOPMENT.md#private-network-http-browser-origins). Local HTTP probes do not prove HTTPS deployment readiness.
 
-The SDK uses `client_secret_basic` with form-encoded client credentials. Network operations have a five-second default timeout; injected `HTTPClient` settings are copied, with absent or greater-than-ten-second timeouts capped at ten seconds. Redirects are always refused. The optional HTTPClient supports a trusted application transport, including a test TLS trust store. Do not disable TLS verification. Response bodies are limited to 32 KiB and decoded into typed values; unknown optional JSON fields are accepted.
+The SDK uses `client_secret_basic` with form-encoded client credentials. Identity operations have a five-second default timeout; injected `HTTPClient` settings are copied, with absent or greater-than-ten-second timeouts capped at ten seconds. Redirects are always refused. The optional HTTPClient supports a trusted application transport, including a test TLS trust store. Do not disable TLS verification. Identity response bodies are limited to 32 KiB and decoded into typed values; unknown optional JSON fields are accepted.
 
 ## Application integration
 
@@ -47,9 +47,33 @@ Use `errors.Is` for errors:
 
 Native introspection's `active:false` does not carry a reliable reason. It is unauthenticated, including when the platform withdrew permission. The SDK never invents a 403 reason absent from the platform response. A failed confidential-client HTTP exchange is a service/configuration failure, not a user's permission denial.
 
+## Call workbench services
+
+Send JSON to `/images/generations`, multipart to `/images/edits`, and stateless JSON to `/responses`. The [supported operation scope](DEVELOPMENT.md#call-shared-workbench-services) excludes JSON edits, provider response IDs, provider file IDs, and tools. Hiro's Responses endpoint accepts `input_text` and inline `input_image` content and forces `store=false`.
+
+`client.ServiceRequest(ctx, sessionHeaders, request)` returns `(*http.Response, error)`. Pass the original incoming session headers separately from a fresh service request. The SDK decrypts and rechecks its own session cookie before using that user's token. Application code does not extract the token or forward the incoming headers.
+
+```go
+base := os.Getenv("APP_SERVICE_OPENAI_BASE_URL")
+request, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/images/generations",
+    strings.NewReader(`{"model":"gpt-image-2","prompt":"A blue ceramic cup on a white table."}`))
+if err != nil { return err }
+request.Header.Set("Content-Type", "application/json")
+response, err := client.ServiceRequest(ctx, incoming.Header, request)
+if err != nil { return err }
+defer response.Body.Close()
+// Check response.StatusCode and consume the native service result.
+```
+
+The only POST targets are the issuer's exact origin plus `/api/app-services/openai/v1/images/generations`, `/api/app-services/openai/v1/images/edits`, and `/api/app-services/openai/v1/responses`. URL credentials, queries, fragments, encoded paths, a different Host, trailers, and other targets are refused. Only `Accept` and `Content-Type` request headers are accepted. Never pass Authorization, cookies, identity, supplier-key, or connection headers. `ErrServiceRequest` identifies a rejected request before submission.
+
+Use the standard `mime/multipart` writer for edits and set its generated content type. The request's headers are copied before authorization is added. The native body is consumed normally. The returned response contains no outbound token in its `Request` field. Service responses retain their HTTP status and unrestricted body size. The caller must close the response body and enforce application resource limits.
+
+Service calls retain the supplied context and have a ten-minute timeout that includes response reads. Identity checks retain their existing limits. `ErrServiceUnavailable` means a transport failure or refused redirect. HTTP errors remain native response values. No service call is automatically retried. A failure or cancellation can leave the supplier outcome unknown. Do not resubmit paid work automatically. This method is included in version 0.2.0.
+
 ## Fixed source and offline consumption
 
-Install the published Go module with `go get github.com/pengpengkuku/hiro-app-auth@v0.1.1`. For offline consumers, use a source archive of the exact reviewed commit and verify its supplied SHA-256. A version identifies the API; the full SHA identifies the source.
+Install the published Go module with `go get github.com/pengpengkuku/hiro-app-auth@v0.2.0`. For offline consumers, use a source archive of the exact reviewed commit and verify its supplied SHA-256. A version identifies the API; the full SHA identifies the source.
 
 From this repository, create and checksum the fixed source (PowerShell):
 
@@ -63,7 +87,7 @@ Get-FileHash -Algorithm SHA256 dist/hiro-app-auth-$revision.tar
 Transfer the archive, full SHA and SHA-256 together. Verify the checksum before extraction. For an offline consumer, extract the reviewed source into the consumer repository at `third_party/hiro-app-auth`, retain LICENSE, and use this relative module replacement:
 
 ```go
-require github.com/pengpengkuku/hiro-app-auth v0.1.1
+require github.com/pengpengkuku/hiro-app-auth v0.2.0
 replace github.com/pengpengkuku/hiro-app-auth => ./third_party/hiro-app-auth
 ```
 

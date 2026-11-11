@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 (`v0.2.0`, `typescript-v0.2.0`, `python-v0.2.0`)
+
+- Add server-side workbench service calls for TypeScript and Go using each SDK's existing session credentials. Restrict calls to the issuer origin and the three supported OpenAI endpoints.
+- Document direct Python calls with the existing authenticated grant, native JSON and multipart handling, and unknown supplier outcomes without automatic retries.
+- Support explicitly approved private-IP HTTP browser origins while keeping credential-bearing identity and service requests on the configured HTTPS issuer. HTTPS remains the default.
+- Reject missing ports in TypeScript HTTP origin configuration, matching the explicit-port contract already enforced by Python and Go.
+- Keep identity API limits unchanged. Publish matching Go source, TypeScript tarball, and Python wheel and source archives.
+
 ## TypeScript 0.1.0 (`typescript-v0.1.0`)
 
 - Add a server-side Node.js SDK with typed configuration and principals.
