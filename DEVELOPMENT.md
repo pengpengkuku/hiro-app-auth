@@ -52,6 +52,8 @@ For all SDKs:
 
 HTTPS remains the default. When the platform operator approves HTTP inside a private network, keep the issuer and every credential-bearing identity or shared-service call on HTTPS. Only browser navigation and the application's own host-only cookie use the approved HTTP origin. Applications do not configure employee certificate trust.
 
+Keep the platform's approved HTTP browser addresses. Do not require HTTPS, new addresses, or employee-installed certificates to make frontend code work. Check browser API availability before use and keep core actions working when secure-context-only APIs are absent. For random browser IDs, [`crypto.randomUUID()`](https://developer.mozilla.org/en-US/docs/Web/API/Crypto/randomUUID) requires a secure context. Use [`crypto.getRandomValues()`](https://developer.mozilla.org/en-US/docs/Web/API/Crypto/getRandomValues) for supported HTTP origins. Keep the helper in the application and preserve its required ID format and cryptographic randomness.
+
 Example values below are synthetic. Obtain the actual values from the operator:
 
 ```text
@@ -143,6 +145,8 @@ The platform generates the current user's enabled/not-enabled state from actual 
 ## 6. Verify one complete user story
 
 Use the application's existing story tests. Replace only external boundaries when a controlled response is needed; keep internal application modules real. Expected behavior comes from the agreed story and protocol, not from copying the implementation into a test.
+
+For approved HTTP deployments, run this story in a browser at the actual platform-provided HTTP origins, including navigation from Hiro. Complete the core action, inspect its result, and log out. For image applications, include generation, expansion, and download where supported. Confirm the expected requests leave the browser and logout clears local state even when revocation is unavailable. A pass on localhost or temporary HTTPS does not prove HTTP compatibility.
 
 Walk this connected story and keep the actual result:
 

@@ -1,4 +1,4 @@
-"""Single-process integration example behind an HTTPS reverse proxy."""
+"""Single-process integration example behind the app's approved reverse proxy."""
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
