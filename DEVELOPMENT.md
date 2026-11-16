@@ -116,6 +116,15 @@ Provide a fixed Docker image or a reproducible Dockerfile, plus the application'
 
 If distributing a Python wheel, download the reviewed release asset during the controlled build preparation, verify its published SHA-256, and copy it into the build context. Install that exact local wheel with its declared dependencies. No repository credential is needed in the image. Dependency lockfiles belong to the consuming application.
 
+### Hand over application operations
+
+- Application maintainers provide service names, pinned artifacts, native deployment definitions, declared storage and dependencies, and commands scoped to starting, stopping, updating, and recovering their application.
+- The Hiro platform operator owns deployment and operations. Complete persistent boot startup and unexpected-exit recovery on first delivery through the existing service manager and container restart policy. The SDK does not manage application processes.
+- Preserve existing data and addresses. Update or restart only the target application and its own proxy or workers. Do not restart Hiro, another application, or the shared container daemon as part of normal application maintenance.
+- Verify the new startup and recovery connections while Hiro and another application's processes remain running. Reuse applicable shared-runtime evidence; do not repeat unchanged host-level fault drills or paid model calls for operations checks. Keep the application's core user-story acceptance separate.
+
+Deployment-specific commands and recovery records belong in the platform's operations documentation.
+
 ## 5. Describe the application
 
 Adapt [the manifest example](examples/app.manifest.json). It is a declaration to review with the platform, not an executable deployment file or a machine-validated schema. Confirm its detailed shape against the current platform contract; do not infer available APIs from it.
