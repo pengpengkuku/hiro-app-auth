@@ -13,6 +13,7 @@ The SDKs verify the native opaque-token profile through online introspection. Th
 | Integrate Python | [Python setup](python/README.md), [API reference](python/REFERENCE.md), [HTTP example](python/examples/http_app.py) |
 | Integrate Go | [Go setup and API](GO.md) |
 | Describe an application | [Manifest example](examples/app.manifest.json) |
+| Maintain or release an SDK | [SDK checks](#develop), [compatibility and releases](DEVELOPMENT.md#7-release-independently) |
 
 ## Install
 
@@ -37,6 +38,10 @@ go get github.com/pengpengkuku/hiro-app-auth@v0.2.0
 Pin a full reviewed commit for reproducible builds. TypeScript packages and Python wheels are attached to their GitHub releases. Neither package is published to a package registry.
 
 ## What each SDK owns
+
+This repository maintains the TypeScript, Go, and Python SDK APIs, usage guides, examples, compatibility notes, checks, and releases. Hiro owns its login and authorization protocol, application registration, and access decisions. Obtain the agreed protocol profile and registration settings from the platform operator.
+
+Consuming applications pin a reviewed SDK version. A Hiro or application update does not require an SDK upgrade while the agreed protocol remains compatible.
 
 | Capability | TypeScript | Python | Go |
 |---|---|---|---|
